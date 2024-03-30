@@ -1,6 +1,7 @@
-import { GoogleGenAI } from "@google/genai";
+import { Content, FunctionDeclaration, GoogleGenAI, Type } from "@google/genai";
 import { NextRequest, NextResponse } from "next/server";
-import { AnalysisResult, ChatMessage, IndicatorSnapshot } from "@/lib/types";
+import { computeSnapshot } from "@/lib/indicators";
+import { AnalysisResult, Candle, ChatMessage, IndicatorSnapshot } from "@/lib/types";
 
 // This route runs server-side only (Next.js API route), so the Gemini key
 // lives in an env var and is never sent to the browser -- the client only
@@ -79,6 +80,75 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 5000):
   throw lastErr;
 }
 
+// --- Rate limiting -----------------------------------------------------
+// Best-effort, in-memory per-IP sliding window. This resets on every cold
+// start / redeploy and isn't shared across serverless instances, so it's
+// not a substitute for an edge-level limiter (e.g. Vercel's or a Redis-
+// backed one) in real production -- but it's real protection against a
+// runaway client hammering the Gemini-backed route in a demo/dev setting,
+// which previously had no protection at all beyond the UI's manual-click
+// trigger.
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 15;
+const rateLimitBuckets = new Map<string, { count: number; windowStart: number }>();
+
+function checkRateLimit(ip: string): { allowed: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(ip);
+  if (!bucket || now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateLimitBuckets.set(ip, { count: 1, windowStart: now });
+    return { allowed: true, retryAfterSec: 0 };
+  }
+  if (bucket.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return { allowed: false, retryAfterSec: Math.ceil((bucket.windowStart + RATE_LIMIT_WINDOW_MS - now) / 1000) };
+  }
+  bucket.count += 1;
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function getClientIp(req: NextRequest): string {
+  const forwarded = req.headers.get("x-forwarded-for");
+  if (forwarded) return forwarded.split(",")[0].trim();
+  return "unknown";
+}
+
+// --- Tool calling (chat mode only) -------------------------------------
+// The "analyze" mode intentionally stays a single structured call -- it
+// pairs with a JSON schema and doesn't need the model to look at anything
+// beyond the current snapshot. Chat is where an agentic loop actually
+// earns its keep: instead of only ever seeing the *latest* indicator
+// values, the model can ask this route to recompute the full indicator
+// set as of N candles ago, on the same raw OHLC series the client sent,
+// and reason about whether a signal is new or has been building.
+const HISTORICAL_TOOL: FunctionDeclaration = {
+  name: "getIndicatorsAtLookback",
+  description:
+    "Recompute the full technical indicator snapshot (SMA20, EMA12/26, RSI14, MACD, Bollinger Bands, last price, % change) as it stood a given number of candles before the most recent one, using the same OHLC candle series the user is currently viewing. Use this to check whether a signal is new, strengthening, or reversing -- e.g. whether RSI was already overbought 10 candles ago, or when a MACD crossover actually happened.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      candlesAgo: {
+        type: Type.INTEGER,
+        description:
+          "How many candles back from the latest one to compute the snapshot at. 0 means the latest candle (same as the current snapshot already given to you).",
+      },
+    },
+    required: ["candlesAgo"],
+  },
+};
+
+function executeHistoricalTool(candles: Candle[], args: Record<string, unknown>): Record<string, unknown> {
+  if (candles.length === 0) {
+    return { error: "No candle history was provided with this request." };
+  }
+  const candlesAgo = Math.max(0, Math.floor(Number(args.candlesAgo) || 0));
+  const cutoff = candles.length - candlesAgo;
+  if (cutoff < 2) {
+    return { error: `Only ${candles.length} candles are available in this window; can't look back ${candlesAgo}.` };
+  }
+  return { candlesAgo, snapshot: computeSnapshot(candles.slice(0, cutoff)) };
+}
+
 function buildContextBlock(displayName: string, snapshot: IndicatorSnapshot): string {
   const lines = [`Instrument: ${displayName}`];
   if (snapshot.lastPrice != null) lines.push(`Last price: ${snapshot.lastPrice}`);
@@ -110,6 +180,10 @@ interface RequestBody {
   snapshot: IndicatorSnapshot;
   chatHistory?: ChatMessage[];
   question?: string;
+  /** Recent OHLC candles backing `snapshot`, used only by chat mode's
+   *  `getIndicatorsAtLookback` tool. Optional so older/other callers of
+   *  this route without candle data still work in "analyze" mode. */
+  candles?: Candle[];
 }
 
 export async function POST(req: NextRequest) {
@@ -121,6 +195,15 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const clientIp = getClientIp(req);
+  const rateLimit = checkRateLimit(clientIp);
+  if (!rateLimit.allowed) {
+    return NextResponse.json(
+      { error: `Rate limit exceeded. Try again in ${rateLimit.retryAfterSec}s.` },
+      { status: 429, headers: { "Retry-After": String(rateLimit.retryAfterSec) } }
+    );
+  }
+
   let body: RequestBody;
   try {
     body = await req.json();
@@ -128,7 +211,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { mode, displayName, snapshot, chatHistory, question } = body;
+  const { mode, displayName, snapshot, chatHistory, question, candles } = body;
   if (!displayName || !snapshot) {
     return NextResponse.json({ error: "Missing displayName/snapshot in request" }, { status: 400 });
   }
@@ -172,7 +255,7 @@ export async function POST(req: NextRequest) {
 
     if (mode === "chat") {
       const history = (chatHistory ?? []).slice(-10); // cap context size
-      const contents = [
+      let contents: Content[] = [
         ...history.map((m) => ({
           role: m.role === "assistant" ? "model" : "user",
           parts: [{ text: m.content }],
@@ -180,18 +263,59 @@ export async function POST(req: NextRequest) {
         { role: "user", parts: [{ text: question ?? "" }] },
       ];
 
-      const resp = await withRetry(() =>
-        ai.models.generateContent({
-          model: MODEL,
-          contents,
-          config: {
-            systemInstruction: `${SYSTEM_PROMPT}\n\nCurrent market snapshot for reference:\n${context}`,
-            maxOutputTokens: 400,
-          },
-        })
-      );
+      const availableCandles = Array.isArray(candles) ? candles : [];
+      const tools = availableCandles.length > 0 ? [{ functionDeclarations: [HISTORICAL_TOOL] }] : undefined;
 
-      return NextResponse.json({ text: resp.text ?? "" });
+      // Agentic function-calling loop: the model can call
+      // `getIndicatorsAtLookback` to pull indicator values from earlier in
+      // the same candle series before answering, instead of only ever
+      // reasoning from the single latest snapshot. Capped so a
+      // misbehaving/looping model can't run away with the request.
+      let finalText = "";
+      const MAX_TOOL_ROUNDS = 3;
+      for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+        const resp = await withRetry(() =>
+          ai.models.generateContent({
+            model: MODEL,
+            contents,
+            config: {
+              systemInstruction: `${SYSTEM_PROMPT}\n\nCurrent market snapshot for reference:\n${context}`,
+              // Higher than the analyze path's 600: a tool round spends part
+              // of its own budget deciding to call the function, and this
+              // model's internal reasoning tokens count against the same
+              // budget as the visible answer -- 400 was observed to cut the
+              // final answer off mid-sentence once a tool round happened.
+              maxOutputTokens: 800,
+              thinkingConfig: { thinkingBudget: 256 },
+              tools,
+            },
+          })
+        );
+
+        const calls = resp.functionCalls;
+        if (!calls || calls.length === 0 || round === MAX_TOOL_ROUNDS) {
+          finalText = resp.text ?? "";
+          break;
+        }
+
+        const modelTurn = resp.candidates?.[0]?.content;
+        if (modelTurn) contents = [...contents, modelTurn];
+
+        const responseParts = calls.map((call) => ({
+          functionResponse: {
+            name: call.name ?? "unknown",
+            response: {
+              output:
+                call.name === "getIndicatorsAtLookback"
+                  ? executeHistoricalTool(availableCandles, call.args ?? {})
+                  : { error: `Unknown tool: ${call.name}` },
+            },
+          },
+        }));
+        contents = [...contents, { role: "user", parts: responseParts }];
+      }
+
+      return NextResponse.json({ text: finalText });
     }
 
     return NextResponse.json({ error: `Unknown mode: ${mode}` }, { status: 400 });
