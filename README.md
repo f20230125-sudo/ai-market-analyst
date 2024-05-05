@@ -48,6 +48,34 @@ would be:
   validated server-side against the expected shape before it reaches the
   frontend, since schema-constrained output is a strong guarantee but not
   an absolute one.
+- **An actual agentic tool-calling loop in chat mode**, not just a bigger
+  prompt. The model is given one real tool, `getIndicatorsAtLookback`,
+  which recomputes the full indicator set as of N candles ago from the
+  same raw OHLC series the user is viewing (`app/api/analyze/route.ts`).
+  When you ask something like *"was RSI already this high 20 candles
+  ago, or did this just happen?"*, Gemini decides to call the tool, the
+  server executes it against real data and returns the result, and the
+  model reasons over that before answering — a real function-call round
+  trip, capped at 3 rounds so a misbehaving model can't loop forever.
+  "Analyze now" deliberately stays a single structured call: it doesn't
+  need history, and mixing tool declarations with schema-constrained
+  output is more failure surface than the feature is worth there.
+- **Tested where it matters**: `lib/indicators.test.ts` (Vitest) checks
+  the hand-rolled SMA/EMA/RSI/MACD/Bollinger math against known edge cases
+  — not just "it runs," but specific asserted values (e.g. RSI at exactly
+  50 on a flat series, bands collapsing to a point at zero variance). A
+  GitHub Actions workflow (`.github/workflows/ci.yml`) runs lint, tests,
+  and a production build on every push. `scripts/eval-analysis.mjs` is a
+  separate, second layer: a small offline eval that hits the live
+  `/api/analyze` route with fixed indicator snapshots that have an
+  unambiguous correct-ish bias (RSI pinned at 97 with price riding the
+  upper band has no reasonable bearish reading) and checks the model's
+  actual output against it — because schema validation proves the shape
+  is right, not that the reasoning is.
+- **Rate-limited**, not just manually gated. `/api/analyze` now enforces
+  a per-IP sliding-window limit (15 req/min) server-side, on top of the
+  UI's manual-trigger design — the gap explicitly called out as missing
+  in an earlier version of this README.
 
 ## About the market data
 
@@ -95,24 +123,55 @@ This deliberately never places an order, real or demo. Two reasons:
 - **lightweight-charts** (TradingView's open-source charting library — what
   most real trading platforms are actually built on)
 - **`@google/genai`** (Gemini) — server-side only, in the Next.js API route
+- **Vitest** for indicator unit tests, run in CI via **GitHub Actions**
+
+**Why Gemini, not Claude:** `gemini-3.6-flash`'s native
+`responseJsonSchema` support was the deciding factor for the "Analyze now"
+path — the signal card needs a hard shape guarantee every time, not a
+prompted-and-hoped-for one. Nothing about the architecture is Gemini-
+specific, though: the schema-constrained call and the tool-calling loop
+in `app/api/analyze/route.ts` are both patterns that map directly onto
+Claude's tool use / structured output, and swapping providers would only
+touch that one file.
+
+## How this was built
+
+This is built with AI as the primary development interface, not AI
+bolted onto a hand-written app: the codebase, this README, the test
+suite, and the agentic tool-calling loop were all built and iterated in
+Claude Code sessions — describing what a piece should do, reviewing the
+diff, running it, and correcting course, rather than writing every line
+by hand first and asking AI to explain it after. That includes gaps a
+human reviewer (in this case, working from a reverse-engineered read of
+Deriv's own AI Engineer job postings) flagged and this session then
+closed in the same sitting: no tests → an indicator test suite and CI; no
+agentic behavior → the `getIndicatorsAtLookback` tool-calling loop; no
+rate limiting → a per-IP limiter; no eval → `scripts/eval-analysis.mjs`.
+The git history from this point forward is the actual build log.
 
 ## Project structure
 
 ```
 app/
   page.tsx              main page: wires chart, indicators, chat together
-  api/analyze/route.ts  server-side Gemini calls (structured analysis + chat)
+  api/analyze/route.ts  server-side Gemini calls (structured analysis +
+                         tool-calling chat), rate limiting
 components/
   Chart.tsx              candlesticks + SMA + Bollinger Bands
   IndicatorPane.tsx       RSI sub-chart
   SymbolSelector.tsx      dropdown of available instruments
   ChatPanel.tsx           chat UI + "Analyze now" button
   SignalCard.tsx          bias/confidence/reasoning display
+  StatsBar.tsx            live indicator readout (price/RSI/MACD/etc.)
 lib/
   mock-market.ts          simulated market-data feed (default data source)
   deriv-client.ts          real Deriv WebSocket integration (drop-in swap)
   indicators.ts            SMA/EMA/RSI/MACD/Bollinger, hand-rolled
+  indicators.test.ts        Vitest suite for the above
   types.ts                 shared TypeScript types
+scripts/
+  eval-analysis.mjs        offline eval for the AI's structured output
+.github/workflows/ci.yml   lint + test + build on every push
 ```
 
 ## Setup (Windows / PowerShell)
@@ -166,6 +225,21 @@ git push -u origin main
 ```
 (Create the empty `deriv-ai-analyst` repo on github.com first.)
 
+## Testing
+
+```powershell
+npm test          # Vitest — indicator math (SMA/EMA/RSI/MACD/Bollinger)
+```
+
+CI runs `lint`, `test`, and `build` on every push (see
+`.github/workflows/ci.yml`). To eval the AI's actual output quality
+(separate from schema-shape validation), run the app (`npm run dev`) and,
+in another terminal:
+
+```powershell
+npm run eval       # hits the live /api/analyze route with fixed cases
+```
+
 ## Deploying it live (optional, but worth doing for a portfolio link)
 
 This is a normal Next.js app, so it deploys cleanly to Vercel (free tier):
@@ -182,7 +256,11 @@ just a GitHub repo.
   confirmation and demo-only enforcement
 - Cache/debounce indicator recomputation instead of recalculating the full
   series on every tick
-- Rate-limit the `/api/analyze` route server-side (currently only
-  protected by the UI's manual-trigger design)
+- Move rate limiting from the in-memory per-instance limiter it has now
+  (resets on cold start, not shared across serverless instances) to an
+  edge- or Redis-backed one
 - Persist chat/analysis history server-side per session instead of only
   in React state, so a refresh doesn't lose context
+- Expand `scripts/eval-analysis.mjs` from a handful of hand-picked cases
+  into a larger, versioned golden set, and run it in CI against a
+  low-cost model tier instead of by hand
