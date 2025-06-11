@@ -193,7 +193,7 @@ export default function Home() {
             </div>
             <div className="min-w-0">
               <h1 className="text-lg font-semibold leading-tight truncate">
-                Deriv AI Market Analyst
+                AI Market Analyst
               </h1>
               <p className="text-xs text-muted truncate">
                 Real indicators + AI-explained signals — educational only, no orders are ever placed.
