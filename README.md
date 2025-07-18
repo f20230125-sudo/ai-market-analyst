@@ -198,6 +198,14 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 **3. Get a Gemini API key** (if you don't already have one): go to
 https://aistudio.google.com/apikey, create a key.
 
+> **Free-tier quota is small and daily, not just per-minute.** A free
+> Gemini API key is currently capped at **20 requests/day** for
+> `gemini-3.6-flash` (on top of a lower per-minute cap) — not the kind of
+> limit a few minutes of clicking around a demo takes to hit. The app
+> surfaces this as a clear "daily quota used up" message rather than a
+> raw error, but if you see it, either wait for the daily reset or attach
+> billing to the AI Studio project for a much higher limit.
+
 **4. Set up your environment file:**
 ```powershell
 copy .env.local.example .env.local
