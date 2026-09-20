@@ -6,16 +6,26 @@ const BIAS_STYLES: Record<string, string> = {
   neutral: "bg-muted/15 text-muted border-muted/30",
 };
 
+const BIAS_ICON: Record<string, string> = {
+  bullish: "▲",
+  bearish: "▼",
+  neutral: "●",
+};
+
 const CONFIDENCE_DOTS: Record<string, number> = { low: 1, medium: 2, high: 3 };
 
 export default function SignalCard({ result }: { result: AnalysisResult }) {
   const biasClass = BIAS_STYLES[result.bias] ?? BIAS_STYLES.neutral;
+  const icon = BIAS_ICON[result.bias] ?? BIAS_ICON.neutral;
   const dots = CONFIDENCE_DOTS[result.confidence] ?? 1;
 
   return (
-    <div className="border border-border rounded-lg p-4 bg-bg/40 space-y-3">
+    <div className="animate-fade-in-up border border-border rounded-lg p-4 bg-bg/40 space-y-3">
       <div className="flex items-center justify-between flex-wrap gap-2">
-        <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase border ${biasClass}`}>
+        <span className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold uppercase border ${biasClass}`}>
+          <span className="text-[10px]" aria-hidden>
+            {icon}
+          </span>
           {result.bias}
         </span>
         <div className="flex items-center gap-1 text-xs text-muted">
