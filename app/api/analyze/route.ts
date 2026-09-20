@@ -332,6 +332,24 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     console.error("[analyze] Gemini API error", err);
     const message = err instanceof Error ? err.message : "Analysis request failed";
+
+    // Gemini's free tier caps requests per DAY (not just per minute), and
+    // the SDK surfaces that as a RESOURCE_EXHAUSTED error with the raw
+    // Google API error JSON as the message -- not something worth showing
+    // a user of this dashboard verbatim. Give the specific, actionable
+    // read instead of a generic 502.
+    if (/RESOURCE_EXHAUSTED|429/.test(message)) {
+      const isDailyCap = /PerDay/i.test(message);
+      return NextResponse.json(
+        {
+          error: isDailyCap
+            ? "This API key's free-tier daily quota for Gemini has been used up. It resets after 24h -- or use an API key with billing enabled for a much higher limit."
+            : "Gemini's free-tier rate limit was hit. Wait a few seconds and try again.",
+        },
+        { status: 429 }
+      );
+    }
+
     return NextResponse.json({ error: message }, { status: 502 });
   }
 }
