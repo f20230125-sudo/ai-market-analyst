@@ -1,4 +1,4 @@
-# Deriv AI Market Analyst
+# AI Market Analyst
 
 A live-feeling trading dashboard: streaming candlestick charts, real
 technical indicators computed from that data, and an AI analyst (Gemini)
@@ -218,7 +218,7 @@ type a question.
 ```powershell
 git init
 git add .
-git commit -m "Add Deriv AI Market Analyst: live charts, real indicators, Gemini-powered analysis"
+git commit -m "Add AI Market Analyst: live charts, real indicators, Gemini-powered analysis"
 git remote add origin https://github.com/f20230125-sudo/deriv-ai-analyst.git
 git branch -M main
 git push -u origin main

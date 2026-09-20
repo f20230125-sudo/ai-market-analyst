@@ -229,7 +229,16 @@ export async function POST(req: NextRequest) {
             systemInstruction: SYSTEM_PROMPT,
             responseMimeType: "application/json",
             responseJsonSchema: ANALYSIS_JSON_SCHEMA,
-            maxOutputTokens: 600,
+            // This model spends "thinking" tokens out of the same budget as
+            // the visible output by default -- with no explicit budget, that
+            // was silently eating most of maxOutputTokens and truncating the
+            // JSON mid-object (seen as "malformed JSON" below, since a cut-
+            // off object is invalid JSON). This is a bounded, schema-
+            // constrained classification+summary task with no need for
+            // extended reasoning, so thinking is disabled outright rather
+            // than just given a bigger shared budget.
+            thinkingConfig: { thinkingBudget: 0 },
+            maxOutputTokens: 700,
           },
         })
       );
@@ -243,6 +252,7 @@ export async function POST(req: NextRequest) {
       try {
         parsed = JSON.parse(text);
       } catch {
+        console.error("[analyze] malformed JSON from model, raw text:", text);
         return NextResponse.json({ error: "Model returned malformed JSON" }, { status: 502 });
       }
 

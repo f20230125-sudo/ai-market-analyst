@@ -5,7 +5,7 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 
 export const metadata: Metadata = {
-  title: "Deriv AI Market Analyst",
+  title: "AI Market Analyst",
   description:
     "Simulated market data, real technical indicators, and an AI analyst that explains what they mean.",
 };
